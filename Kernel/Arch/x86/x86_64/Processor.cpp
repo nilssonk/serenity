@@ -12,6 +12,7 @@
 #include <Kernel/Random.h>
 #include <Kernel/Scheduler.h>
 #include <Kernel/Sections.h>
+#include <Kernel/StackWriter.h>
 #include <Kernel/Thread.h>
 
 namespace Kernel {
@@ -71,32 +72,51 @@ FlatPtr Processor::init_context(Thread& thread, bool leave_crit)
         m_in_critical = 1; // leave it without triggering anything or restoring flags
     }
 
-    u64 kernel_stack_top = thread.kernel_stack_top();
-
-    // Add a random offset between 0-256 (16-byte aligned)
-    kernel_stack_top -= round_up_to_power_of_two(get_fast_random<u8>(), 16);
-
-    u64 stack_top = kernel_stack_top;
-
     // TODO: handle NT?
     VERIFY((cpu_flags() & 0x24000) == 0); // Assume !(NT | VM)
 
-    auto& regs = thread.regs();
-    bool return_to_user = (regs.cs & 3) != 0;
+    // Get stack top and add a random offset between 0-256 (16-byte aligned)
+    u64 const kernel_stack_top = thread.kernel_stack_top() - round_up_to_power_of_two(get_fast_random<u8>(), 16);
 
-    stack_top -= 1 * sizeof(u64);
-    *reinterpret_cast<u64*>(kernel_stack_top - 2 * sizeof(u64)) = FlatPtr(&exit_kernel_thread);
+    StackWriter w(kernel_stack_top);
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <-- kernel_stack_top, stack_top
+     * ------- LO -------
+     */
 
-    stack_top -= sizeof(RegisterState);
+    // We want to end up 16-byte aligned, %rsp + 8 should be aligned
+    constexpr u64 padding_value { 0 };
+    w.write(padding_value);
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <--- kernel_stack_top
+     * padding (8h) <--- stack_top
+     * ------- LO -------
+     */
 
-    // we want to end up 16-byte aligned, %rsp + 8 should be aligned
-    stack_top -= sizeof(u64);
-    *reinterpret_cast<u64*>(kernel_stack_top - sizeof(u64)) = 0;
+    // Add pointer to the exit function
+    w.write(FlatPtr(&exit_kernel_thread));
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <--- kernel_stack_top
+     * padding (8h)
+     * Ptr(exit_kernel_thread) (8h) <--- stack_top
+     * ------- LO -------
+     */
 
-    // set up the stack so that after returning from thread_context_first_enter()
+    // Set up the stack so that after returning from thread_context_first_enter()
     // we will end up either in kernel mode or user mode, depending on how the thread is set up
     // However, the first step is to always start in kernel mode with thread_context_first_enter
-    RegisterState& iretframe = *reinterpret_cast<RegisterState*>(stack_top);
+    auto& regs = thread.regs();
+    bool const is_kernel_thread = (regs.cs & 3) == 0;
+    auto& iretframe = w.emplace<RegisterState>();
     iretframe.rdi = regs.rdi;
     iretframe.rsi = regs.rsi;
     iretframe.rbp = regs.rbp;
@@ -116,26 +136,60 @@ FlatPtr Processor::init_context(Thread& thread, bool leave_crit)
     iretframe.rflags = regs.rflags;
     iretframe.rip = regs.rip;
     iretframe.cs = regs.cs;
-    if (return_to_user) {
+    if (!is_kernel_thread) {
         iretframe.userspace_rsp = regs.rsp;
         iretframe.userspace_ss = GDT_SELECTOR_DATA3 | 3;
     } else {
         iretframe.userspace_rsp = kernel_stack_top;
         iretframe.userspace_ss = 0;
     }
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <--- kernel_stack_top
+     * padding (8h)
+     * Ptr(exit_kernel_thread) (8h)
+     * RegisterState (b0h) <--- stack_top
+     * ------- LO -------
+     */
 
-    // make space for a trap frame
-    stack_top -= sizeof(TrapFrame);
-    TrapFrame& trap = *reinterpret_cast<TrapFrame*>(stack_top);
+    // Make space for a trap frame
+    auto& trap = w.emplace<TrapFrame>();
     trap.regs = &iretframe;
     trap.prev_irq_level = 0;
     trap.next_trap = nullptr;
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <--- kernel_stack_top
+     * padding (8h)
+     * Ptr(exit_kernel_thread) (8h)
+     * RegisterState (b0h)
+     * TrapFrame (18h) <--- stack_top
+     * ------- LO -------
+     */
 
-    stack_top -= sizeof(u64); // pointer to TrapFrame
-    *reinterpret_cast<u64*>(stack_top) = stack_top + 8;
+    // Add a pointer to the preceding trap frame
+    w.write(w.get());
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <--- kernel_stack_top
+     * padding (8h)
+     * Ptr(exit_kernel_thread) (8h)
+     * RegisterState (b0h)
+     * TrapFrame (18h)
+     * Ptr(TrapFrame) (8h) <--- stack_top
+     * ------- LO -------
+     */
+
+    FlatPtr const stack_top = w.get();
 
     if constexpr (CONTEXT_SWITCH_DEBUG) {
-        if (return_to_user) {
+        if (!is_kernel_thread) {
             dbgln("init_context {} ({}) set up to execute at rip={}:{}, rsp={}, stack_top={}, user_top={}",
                 thread,
                 VirtualAddress(&thread),
@@ -153,7 +207,7 @@ FlatPtr Processor::init_context(Thread& thread, bool leave_crit)
         }
     }
 
-    // make switch_context() always first return to thread_context_first_enter()
+    // Make switch_context() always first return to thread_context_first_enter()
     // in kernel mode, so set up these values so that we end up popping iretframe
     // off the stack right after the context switch completed, at which point
     // control is transferred to what iretframe is pointing to.
