@@ -79,13 +79,37 @@ FlatPtr Processor::init_context(Thread& thread, bool leave_crit)
     u64 const kernel_stack_top = thread.kernel_stack_top() - round_up_to_power_of_two(get_fast_random<u8>(), 16);
 
     StackWriter w(kernel_stack_top);
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <-- kernel_stack_top, stack_top
+     * ------- LO -------
+     */
 
     // We want to end up 16-byte aligned, %rsp + 8 should be aligned
     constexpr u64 padding_value { 0 };
     w.push(padding_value);
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <--- kernel_stack_top
+     * Padding (8h) <--- stack_top
+     * ------- LO -------
+     */
 
     // Add pointer to the exit function
     w.push(FlatPtr(&exit_kernel_thread));
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <--- kernel_stack_top
+     * Padding (8h)
+     * Ptr(exit_kernel_thread) (8h) <--- stack_top
+     * ------- LO -------
+     */
 
     // Set up the stack so that after returning from thread_context_first_enter()
     // we will end up either in kernel mode or user mode, depending on how the thread is set up
@@ -119,15 +143,48 @@ FlatPtr Processor::init_context(Thread& thread, bool leave_crit)
         iretframe.userspace_rsp = kernel_stack_top;
         iretframe.userspace_ss = 0;
     }
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <--- kernel_stack_top
+     * Padding (8h)
+     * Ptr(exit_kernel_thread) (8h)
+     * RegisterState (b0h) <--- stack_top
+     * ------- LO -------
+     */
 
     // Make space for a trap frame
     auto& trap = w.emplace<TrapFrame>();
     trap.regs = &iretframe;
     trap.prev_irq_level = 0;
     trap.next_trap = nullptr;
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <--- kernel_stack_top
+     * Padding (8h)
+     * Ptr(exit_kernel_thread) (8h)
+     * RegisterState (b0h)
+     * TrapFrame (18h) <--- stack_top
+     * ------- LO -------
+     */
 
     // Add a pointer to the preceding trap frame
     w.push(w.get());
+    /*
+     * Current stack
+     *
+     * ------- HI -------
+     * <--- kernel_stack_top
+     * Padding (8h)
+     * Ptr(exit_kernel_thread) (8h)
+     * RegisterState (b0h)
+     * TrapFrame (18h)
+     * Ptr(TrapFrame) (8h) <--- stack_top
+     * ------- LO -------
+     */
 
     FlatPtr const stack_top = w.get();
 
